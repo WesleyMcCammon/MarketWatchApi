@@ -17,21 +17,19 @@ public class TechnicalService
     public void Start(IHubContext<TechnicalDataHub> technicalDataHub, List<TradingSymbol> tradingSymbols)
     {
         _technicalDataHub = technicalDataHub;
-        _historicalDataService.HistoricalDataEventHandler += _historicalDataService_HistoricalDataEventHandler;
-        List<PriceData> priceData = _historicalDataService.LoadDaily(tradingSymbols);
 
-        int[] target = new int[] { 0, 15, 30, 45 };
+        //int[] target = new int[] { 0, 15, 30, 45 };
 
-        //List<int> minutes = new List<int>();
-        //int currentMinute = DateTime.Now.Minute;
-        //while(minutes.Count < 30)
-        //{
-        //    currentMinute++;
-        //    if (currentMinute == 60) currentMinute = 0;
+        List<int> minutes = new List<int>();
+        int currentMinute = DateTime.Now.Minute;
+        while (minutes.Count < 30)
+        {
+            currentMinute++;
+            if (currentMinute == 60) currentMinute = 0;
 
-        //    minutes.Add(currentMinute);
-        //}
-        //int[] target = minutes.ToArray();
+            minutes.Add(currentMinute);
+        }
+        int[] target = minutes.ToArray();
 
         DateTime currentDateTime = DateTime.Now;
         int nextMinute = 0;
@@ -71,7 +69,7 @@ public class TechnicalService
             {
                 while (true)
                 {
-                    _historicalDataService.LoadIntraday(tradingSymbols, "M", 15);
+                    IntradayTechnicalJob(tradingSymbols);
                     Task waitTask = Task.Run(async () => { await Task.Delay(TimeSpan.FromSeconds(15 * 60)); });
                     waitTask.Wait();
                 }
@@ -83,14 +81,24 @@ public class TechnicalService
         });
     }
 
-    private void _historicalDataService_HistoricalDataEventHandler(PriceDataEvent priceDataEvent)
+    private void IntradayTechnicalJob(List<TradingSymbol> tradingSymbols)
     {
-        if (priceDataEvent.Type == "Daily")
-            CalculatePivots(priceDataEvent.PriceData, "STANDARD");
-        else
-        {
-            HeikinAshi(priceDataEvent.PriceData);
-        }
+        tradingSymbols.ForEach(tradingSymbol => { 
+            PriceData priceData = _historicalDataService.LoadIntraday(tradingSymbol, "M", 15);
+            List<HeikinAshiMessage> heikinAshiMessages = CalculateHeikinAshi(priceData);
+
+            if(heikinAshiMessages.Any())
+            {
+                _technicalDataHub.Clients.All.SendAsync("technical", JsonConvert.SerializeObject(heikinAshiMessages.First(),
+                new JsonSerializerSettings
+                {
+                    ContractResolver = new DefaultContractResolver
+                    {
+                        NamingStrategy = new CamelCaseNamingStrategy()
+                    }
+                }));
+            }
+        });
     }
 
     private static List<SkenderOHLC> ConvertCandles(List<OHLC> candles)
@@ -130,206 +138,70 @@ public class TechnicalService
     public List<PivotPoint> GetPivots(List<TradingSymbol> tradingSymbols, string pivotName)
     {
         List<PivotPoint> pivotPoints = new List<PivotPoint>();
-        List<PriceData> priceData = _historicalDataService.LoadDaily(tradingSymbols);
 
-        priceData.ForEach(pd =>
-        {
-            List<SkenderOHLC> skenderOHLCs = ConvertCandles(pd.Prices);
+        tradingSymbols.ForEach(tradingSymbol => {
+            PriceData priceData = _historicalDataService.LoadDaily(tradingSymbol);
+            List<SkenderOHLC> skenderOHLCs = ConvertCandles(priceData.Prices);
             IEnumerable<PivotPointsResult> pivotPointResults = skenderOHLCs.Skip(skenderOHLCs.Count - 2).Take(2)
                 .GetPivotPoints(PeriodSize.Day, GetPivotPointType(pivotName));
-            pivotPoints.Add(new PivotPoint(pd.Symbol, pivotName, pivotPointResults.Last()));
+            pivotPoints.Add(new PivotPoint(priceData.Symbol, pivotName, pivotPointResults.Last()));
+
         });
 
         return pivotPoints;
-    }
-
-    private void CalculatePivots(List<PriceData> priceData, string pivotName)
-    {
-        foreach (PriceData price in priceData)
-        {
-            List<SkenderOHLC> skenderOHLCs = ConvertCandles(price.Prices);
-            IEnumerable<PivotPointsResult> pivotPointResults = skenderOHLCs.Skip(skenderOHLCs.Count - 2).Take(2)
-                .GetPivotPoints(PeriodSize.Day, GetPivotPointType(pivotName));
-
-            PivotPointMessage pivotPointMessage = new PivotPointMessage
-            {
-                Name = "PIVOTS",
-                Symbol = price.Symbol,
-                PivotPointsResult = pivotPointResults.Last()
-            };
-
-            _technicalDataHub.Clients.All.SendAsync("technical", JsonConvert.SerializeObject(pivotPointMessage,
-            new JsonSerializerSettings
-            {
-                ContractResolver = new DefaultContractResolver
-                {
-                    NamingStrategy = new CamelCaseNamingStrategy()
-                }
-            }));
-        }
     }
 
     #endregion
 
     #region HeikinAshi
 
-    private void HistoricalHeikinAshi(PriceData price, List<OHLC> heikinAshiCandles, bool writeOutput = false)
+    private List<HeikinAshiMessage> CalculateHeikinAshi(PriceData priceData, bool createHistoricalOutput = false, bool writeOutput = false)
     {
-        OHLC lastHeikinAshiCandle = heikinAshiCandles.Last();
-        var output = new StringBuilder();
         List<HeikinAshiMessage> heikinAshiMessages = new List<HeikinAshiMessage>();
+        List<SkenderOHLC> skenderOHLCs = ConvertCandles(priceData.Prices);
+        List<OHLC> heikinAshiCandles = skenderOHLCs.GetHeikinAshi().ToList().Select(ha =>
+            new OHLC
+            {
+                Open = FormatPrice(priceData.Symbol, ha.Open),
+                High = ha.High,
+                Low = ha.Low,
+                Close = FormatPrice(priceData.Symbol, ha.Close),
+                Volume = ha.Volume,
+                Date = ha.Date
+            }).ToList();
 
         int alertSequenceNumber = 0;
 
-        heikinAshiCandles.ToList().ForEach(heikinAshiCandle => {
-            OHLC actualCandle = price.Prices.Where(c => c.Date == heikinAshiCandle.Date).First();
-            bool isLast = heikinAshiCandles.Last() == heikinAshiCandle;
+        for (var index = 0; index < heikinAshiCandles.Count(); index++)
+        {
+            bool isLast = index == heikinAshiCandles.Count - 1;
 
-            bool alertRed = DifferenceThreshold(price.Symbol, heikinAshiCandle.Open, heikinAshiCandle.High);
-            bool alertGreen = DifferenceThreshold(price.Symbol, heikinAshiCandle.Open, heikinAshiCandle.Low);
-
+            OHLC heikinAshiCandle = heikinAshiCandles[index];
+            OHLC actualCandle = priceData.Prices.Where(c => c.Date == heikinAshiCandle.Date).First();
+            bool alertRed = DifferenceThreshold(priceData.Symbol, heikinAshiCandle.Open, heikinAshiCandle.High);
+            bool alertGreen = DifferenceThreshold(priceData.Symbol, heikinAshiCandle.Open, heikinAshiCandle.Low);
             string alertType = alertRed ? "RED" : alertGreen ? "GREEN" : string.Empty;
 
             alertSequenceNumber = string.IsNullOrEmpty(alertType) ? 0 : alertSequenceNumber + 1;
             if (!string.IsNullOrEmpty(alertType))
             {
-                HeikinAshiMessage heikinAshiMessage = new HeikinAshiMessage
+                if(isLast && alertSequenceNumber == 1)
                 {
-                    Name = "HEIKINASHI",
-                    AlertType = alertType,
-                    AlertSequenceNumber = alertSequenceNumber,
-                    Symbol = price.Symbol,
-                    TimeFrame = price.TimeFrame,
-                    TimeFrameLength = price.TimeFrameLength,
-                    AlertDateTime = actualCandle.Date
-                };
-
-                if(writeOutput)
-                {
-                    heikinAshiMessages.Add(heikinAshiMessage);
-                    var timeString = string.Format("{0} {1}", actualCandle.Date.ToShortDateString(), actualCandle.Date.ToShortTimeString());
-                    output.AppendLine(string.Format("{0},{1},{2}", timeString, alertType, alertSequenceNumber));
-                }
-
-                _technicalDataHub.Clients.All.SendAsync("technical", JsonConvert.SerializeObject(heikinAshiMessage,
-                new JsonSerializerSettings
-                {
-                    ContractResolver = new DefaultContractResolver
+                    heikinAshiMessages.Add(new HeikinAshiMessage
                     {
-                        NamingStrategy = new CamelCaseNamingStrategy()
-                    }
-                }));
-            }
-        });
-
-        if(writeOutput)
-        {
-            var fileName = string.Format(@"c:\workspace\{0}.csv", price.Symbol);
-            if (File.Exists(fileName)) File.Delete(fileName);
-            File.WriteAllText(fileName, output.ToString());
-        }
-    }
-
-    private void HeikinAshi(List<PriceData> priceData, bool createHistoricalOutput = false, bool writeOutput = false)
-    {
-        foreach (PriceData price in priceData)
-        {
-            List<SkenderOHLC> skenderOHLCs = ConvertCandles(price.Prices);
-            List<OHLC> heikinAshiCandles = skenderOHLCs.GetHeikinAshi().ToList().Select(ha =>
-                new OHLC
-                {
-                    Open = FormatPrice(price.Symbol, ha.Open),
-                    High = ha.High,
-                    Low = ha.Low,
-                    Close = FormatPrice(price.Symbol, ha.Close),
-                    Volume = ha.Volume,
-                    Date = ha.Date
-                }).ToList();
-
-            if (createHistoricalOutput)
-            {
-                HistoricalHeikinAshi(price, heikinAshiCandles, writeOutput);
-            }
-            else
-            {
-                int alertSequenceNumber = 0;
-
-                for (var index = 0; index < heikinAshiCandles.Count(); index++)
-                {
-                    bool isLast = index == heikinAshiCandles.Count - 1;
-
-                    OHLC heikinAshiCandle = heikinAshiCandles[index];
-                    OHLC actualCandle = price.Prices.Where(c => c.Date == heikinAshiCandle.Date).First();
-                    bool alertRed = DifferenceThreshold(price.Symbol, heikinAshiCandle.Open, heikinAshiCandle.High);
-                    bool alertGreen = DifferenceThreshold(price.Symbol, heikinAshiCandle.Open, heikinAshiCandle.Low);
-                    string alertType = alertRed ? "RED" : alertGreen ? "GREEN" : string.Empty;
-
-                    alertSequenceNumber = string.IsNullOrEmpty(alertType) ? 0 : alertSequenceNumber + 1;
-                    if (!string.IsNullOrEmpty(alertType))
-                    {
-                        HeikinAshiMessage heikinAshiMessage = new HeikinAshiMessage
-                        {
-                            Name = "HEIKINASHI",
-                            AlertType = alertType,
-                            AlertSequenceNumber = alertSequenceNumber,
-                            Symbol = price.Symbol,
-                            TimeFrame = price.TimeFrame,
-                            TimeFrameLength = price.TimeFrameLength,
-                            AlertDateTime = actualCandle.Date
-                        };
-
-                        if (isLast && alertSequenceNumber == 1)
-                        {
-                            _technicalDataHub.Clients.All.SendAsync("technical", JsonConvert.SerializeObject(heikinAshiMessage,
-                            new JsonSerializerSettings
-                            {
-                                ContractResolver = new DefaultContractResolver
-                                {
-                                    NamingStrategy = new CamelCaseNamingStrategy()
-                                }
-                            }));
-                        }
-                    }
-                }
-
-                if (heikinAshiCandles.Any())
-                {
-                    OHLC lastHeikinAshiCandle = heikinAshiCandles.Last();
-                    heikinAshiCandles.ToList().ForEach(heikinAshiCandle => {
-                        OHLC actualCandle = price.Prices.Where(c => c.Date == heikinAshiCandle.Date).First();
-
-                        bool alertRed = DifferenceThreshold(price.Symbol, heikinAshiCandle.Open, heikinAshiCandle.High);
-                        bool alertGreen = DifferenceThreshold(price.Symbol, heikinAshiCandle.Open, heikinAshiCandle.Low);
-
-                        string alertType = alertRed ? "RED" : alertGreen ? "GREEN" : string.Empty;
-
-                        alertSequenceNumber = string.IsNullOrEmpty(alertType) ? 0 : alertSequenceNumber + 1;
-                        if (!string.IsNullOrEmpty(alertType))
-                        {
-                            HeikinAshiMessage heikinAshiMessage = new HeikinAshiMessage
-                            {
-                                Name = "HEIKINASHI",
-                                AlertType = alertType,
-                                AlertSequenceNumber = alertSequenceNumber,
-                                Symbol = price.Symbol,
-                                TimeFrame = price.TimeFrame,
-                                TimeFrameLength = price.TimeFrameLength,
-                                AlertDateTime = actualCandle.Date
-                            };
-
-                            _technicalDataHub.Clients.All.SendAsync("technical", JsonConvert.SerializeObject(heikinAshiMessage,
-                            new JsonSerializerSettings
-                            {
-                                ContractResolver = new DefaultContractResolver
-                                {
-                                    NamingStrategy = new CamelCaseNamingStrategy()
-                                }
-                            }));
-                        }
+                        Name = "HEIKINASHI",
+                        AlertType = alertType,
+                        AlertSequenceNumber = alertSequenceNumber,
+                        Symbol = priceData.Symbol,
+                        TimeFrame = priceData.TimeFrame,
+                        TimeFrameLength = priceData.TimeFrameLength,
+                        AlertDateTime = actualCandle.Date
                     });
                 }
             }
         }
+
+        return heikinAshiMessages;
     }
 
     #endregion
